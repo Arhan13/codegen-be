@@ -3,26 +3,17 @@ from typing import Optional
 import re
 import time
 import asyncio
-import threading
-import logging
 from collections import OrderedDict
 
-# Configure logging for better debugging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 app = FastAPI(
-    title="Localization Manager Backend (Fixed)",
-    description="A high-performance backend service for managing localized React components with optimized caching",
-    version="0.2.0",
+    title="Localization Manager Backend",
+    description="A backend service for managing localized React components with templates",
+    version="0.1.0",
 )
 
-# FIX #2: Increased concurrency limit from 2 to 50
-CONCURRENCY_LIMIT = 50  # Much more reasonable for production load
+# Concurrency limit to shed load at high load
+CONCURRENCY_LIMIT = 2
 concurrency_semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-
-# Performance metrics
-cache_stats = {"hits": 0, "misses": 0, "evictions": 0, "errors": 0}
 
 
 async def limit_concurrency():
@@ -31,95 +22,59 @@ async def limit_concurrency():
         yield
 
 
-# FIX #1: Thread-safe LRU Cache with proper locking and error handling
+# Simple LRU Cache with TTL
 class TTLCache:
-    def __init__(self, maxsize=100, ttl=600):  # FIX #3: Consistent 10 minute TTL
+    def __init__(self, maxsize=100, ttl=300):  # Default 5 minutes TTL
         self.maxsize = maxsize
         self.ttl = ttl
         self.cache = OrderedDict()
         self.timestamps = {}
-        self._lock = threading.RLock()  # Thread-safe operations
 
     def get(self, key):
-        with self._lock:  # Atomic read operation
-            if key in self.cache:
-                current_time = time.time()
-                timestamp = self.timestamps.get(key, 0)
+        if key in self.cache:
+            current_time = time.time()
+            timestamp = self.timestamps.get(key, 0)
 
-                if current_time - timestamp > self.ttl:
-                    # Remove expired item atomically
-                    try:
-                        del self.cache[key]
-                        del self.timestamps[key]
-                        cache_stats["evictions"] += 1
-                        logger.debug(f"Cache expired: {key}")
-                    except KeyError:
-                        # FIX #5: Better error handling with logging
-                        logger.warning(f"Failed to remove expired key: {key}")
-                        cache_stats["errors"] += 1
-                    return None
+            if current_time - timestamp > self.ttl:
+                # Remove expired item
+                del self.cache[key]
+                del self.timestamps[key]
+                return None
 
-                # Move to end (most recently used)
-                self.cache.move_to_end(key)
-                cache_stats["hits"] += 1
-                return self.cache[key]
-
-            cache_stats["misses"] += 1
-            return None
+            # Move to end (most recently used)
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        return None
 
     def put(self, key, value):
-        with self._lock:  # Atomic write operation
-            if key in self.cache:
-                # Update existing item
-                self.cache.move_to_end(key)
-                self.cache[key] = value
-                self.timestamps[key] = time.time()
-                return
-
-            # Check if we need to evict
+        if key in self.cache:
+            # Update existing item
+            self.cache.move_to_end(key)
+        else:
             if len(self.cache) >= self.maxsize:
-                # FIX #1: Safe eviction with proper error handling
+                # Remove least recently used item
                 try:
-                    if self.cache:  # Ensure cache is not empty
-                        oldest_key = next(iter(self.cache))
-                        # Atomic removal of both entries
-                        del self.cache[oldest_key]
-                        if oldest_key in self.timestamps:
-                            del self.timestamps[oldest_key]
-                        cache_stats["evictions"] += 1
-                        logger.debug(f"Cache evicted: {oldest_key}")
-                except (StopIteration, KeyError) as e:
-                    logger.error(f"Cache eviction failed: {e}")
-                    cache_stats["errors"] += 1
+                    oldest_key = next(iter(self.cache))
+                    del self.cache[oldest_key]
+                    del self.timestamps[oldest_key]
+                except (StopIteration, KeyError):
+                    pass
 
-            # Add new item
-            self.cache[key] = value
-            self.timestamps[key] = time.time()
+        self.cache[key] = value
+        self.timestamps[key] = time.time()
 
     def clear(self):
-        with self._lock:
-            self.cache.clear()
-            self.timestamps.clear()
-            logger.info("Cache cleared")
+        self.cache.clear()
+        self.timestamps.clear()
 
     def size(self):
-        with self._lock:
-            return len(self.cache)
-
-    def get_stats(self):
-        with self._lock:
-            return {
-                "size": len(self.cache),
-                "max_size": self.maxsize,
-                "ttl_seconds": self.ttl,
-                **cache_stats,
-            }
+        return len(self.cache)
 
 
-# Initialize cache instance with fixed TTL
-component_cache = TTLCache(maxsize=100, ttl=600)  # FIX #3: Consistent 10 minutes
+# Initialize cache instance
+component_cache = TTLCache(maxsize=50, ttl=600)  # 10 minutes TTL for components
 
-# Pseudo database with localized strings (unchanged)
+# Pseudo database with localized strings
 LOCALIZATION_DB = {
     "en": {
         "welcome_title": "Welcome to Our App",
@@ -191,7 +146,7 @@ LOCALIZATION_DB = {
     },
 }
 
-# React Component Templates (unchanged)
+# React Component Templates with data attributes
 COMPONENT_TEMPLATES = {
     "welcome": {
         "component_name": "WelcomeComponent",
@@ -358,8 +313,7 @@ def get_localized_component(component_type: str, lang: str) -> dict:
         template_data["template"], component_strings
     )
 
-    # FIX #4: Stable component ID without volatile timestamp
-    component_id = f"{component_type}_{lang}_v1"  # Static version-based ID
+    component_id = f"{component_type}_{lang}_{int(time.time() * 1000) % 10000}"
 
     return {
         "component_name": template_data["component_name"],
@@ -371,33 +325,19 @@ def get_localized_component(component_type: str, lang: str) -> dict:
             "component_id": component_id,
             "last_updated": "2024-01-15T10:30:00Z",
             "required_keys": required_keys,
-            "cache_key": f"component:{component_type}:{lang}",  # Expose for debugging
         },
     }
 
 
 @app.get("/health")
 async def health_check(concurrency: None = Depends(limit_concurrency)):
-    """Enhanced health check with performance metrics"""
+    """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "localization-manager-backend-fixed",
-        "version": "0.2.0",
+        "service": "localization-manager-backend",
+        "version": "0.1.0",
+        "cache_size": component_cache.size(),
         "concurrency_limit": CONCURRENCY_LIMIT,
-        "cache_stats": component_cache.get_stats(),
-        "performance": {
-            "active_requests": CONCURRENCY_LIMIT - concurrency_semaphore._value,
-            "cache_hit_rate": (
-                round(
-                    cache_stats["hits"]
-                    / (cache_stats["hits"] + cache_stats["misses"])
-                    * 100,
-                    2,
-                )
-                if (cache_stats["hits"] + cache_stats["misses"]) > 0
-                else 0
-            ),
-        },
     }
 
 
@@ -407,65 +347,28 @@ async def get_localized_component_endpoint(
     lang: str = Query(default="en", description="Language code (en, es, fr, de)"),
     concurrency: None = Depends(limit_concurrency),
 ):
-    """Returns a localized React component with optimized caching"""
+    """Returns a localized React component based on template and language"""
 
-    # FIX #4: Stable cache key without volatile data
     cache_key = f"component:{component_type}:{lang}"
 
-    # Try cache first
     cached_result = component_cache.get(cache_key)
     if cached_result:
-        logger.debug(f"Cache hit: {cache_key}")
-        return {
-            **cached_result,
-            "cached": True,
-            "cache_stats": component_cache.get_stats(),
-        }
+        return {**cached_result, "cached": True}
 
-    # Cache miss - generate component
-    logger.debug(f"Cache miss: {cache_key}")
     try:
         component = get_localized_component(component_type, lang)
 
-        # Cache the result
         component_cache.put(cache_key, component)
 
-        return {
-            **component,
-            "cached": False,
-            "cache_stats": component_cache.get_stats(),
-        }
+        return {**component, "cached": False}
     except ValueError as e:
-        logger.error(f"Component generation error: {e}")
         return {
             "error": str(e),
             "available_components": list(COMPONENT_TEMPLATES.keys()),
-            "cache_stats": component_cache.get_stats(),
         }
-
-
-@app.post("/admin/cache/clear")
-async def clear_cache():
-    """Admin endpoint to clear cache - useful for testing"""
-    component_cache.clear()
-    # Reset stats
-    for key in cache_stats:
-        cache_stats[key] = 0
-
-    return {
-        "message": "Cache cleared successfully",
-        "cache_stats": component_cache.get_stats(),
-    }
-
-
-@app.get("/admin/cache/stats")
-async def get_cache_stats():
-    """Admin endpoint to get detailed cache statistics"""
-    return component_cache.get_stats()
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    logger.info("Starting optimized localization manager backend...")
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
